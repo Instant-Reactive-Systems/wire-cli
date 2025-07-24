@@ -1,0 +1,10 @@
+/target
+.vscode
+package-lock.json
+.idea
+/.stfolder
+/.stversions
+/.stignore
+/~
+/style/frontend.css
+/dist
