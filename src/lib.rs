@@ -1,6 +1,8 @@
 mod tui;
 
 use std::collections::VecDeque;
+use futures::{SinkExt, StreamExt};
+use tokio::sync::mpsc::{Receiver, Sender};
 pub use tui::{Tui, Event};
 
 /// The maximum number of messages in the message history buffer.
@@ -20,9 +22,13 @@ pub struct ClientCfg {
 
 /// A client that starts a TUI app for communicating with a server
 /// and sending it requests.
-pub struct Client<Req, Res, Err> {
-	tx: (),
-	rx: (),
+pub struct Client<Req, Res, Err> 
+where 
+	Req: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug + Send + 'static,
+	Res: serde::de::DeserializeOwned + std::fmt::Debug + Send + 'static,
+	Err: serde::de::DeserializeOwned + std::fmt::Debug + Send + 'static,
+{
+	cfg: ClientCfg,
 	input: String,
 	msgs: VecDeque<String>,
 	state: State,
@@ -30,12 +36,16 @@ pub struct Client<Req, Res, Err> {
 	_phant: std::marker::PhantomData<(Req, Res, Err)>,
 }
 
-impl<Req, Res, Err> Client<Req, Res, Err> {
+impl<Req, Res, Err> Client<Req, Res, Err> 
+where 
+	Req: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug + Send + 'static,
+	Res: serde::de::DeserializeOwned + std::fmt::Debug + Send + 'static,
+	Err: serde::de::DeserializeOwned + std::fmt::Debug + Send + 'static,
+{
 	/// Creates a new client.
 	pub fn new(cfg: ClientCfg) -> Self {
 		Self {
-			tx: (),
-			rx: (),
+			cfg,
 			input: Default::default(),
 			msgs: Default::default(),
 			state: State::InputSelected,
@@ -47,19 +57,71 @@ impl<Req, Res, Err> Client<Req, Res, Err> {
 	/// Starts the client.
 	pub async fn start(self) -> color_eyre::Result<()> {
 		color_eyre::install()?;
+
+		let (stream, _res) = tokio_tungstenite::connect_async(self.cfg.url.clone()).await?;
+		let (mut ws_tx, mut ws_rx) = stream.split();
+		let (res_tx, res_rx) = tokio::sync::mpsc::channel::<Result<Res, Err>>(100);
+		let (req_tx, mut req_rx) = tokio::sync::mpsc::channel::<Req>(100);
+
+		// read ws messages
+		let read_ws_task = tokio::spawn(async move {
+			while let Some(msg) = ws_rx.next().await {
+				match msg {
+					Ok(msg) => {
+						match msg {
+							tokio_tungstenite::tungstenite::Message::Text(text) => {
+								// TODO: support more message formats
+								#[cfg(feature = "json")]
+								let res = serde_json::from_str::<Result<Res, Err>>(&text).expect("server should always send valid messages");
+								if let Err(_err) = res_tx.send(res).await {
+									break;
+								};
+							},
+							_ => {},
+						}
+					},
+					Err(err) => panic!("WebSocket error: {}", err),
+				}
+			}
+		});
+
+		// write ws messages
+		let write_ws_task = tokio::spawn(async move {
+			while let Some(req) = req_rx.recv().await {
+				let msg = serde_json::to_string(&req).expect("request should always be serializable");
+				if let Err(_err) = ws_tx.send(tokio_tungstenite::tungstenite::Message::Text(msg.into())).await {
+					break;
+				}
+			}
+		});
+
 		let mut tui = tui::Tui::new()?
 			.tick_rate(4.0) // 4 ticks per second
 			.frame_rate(30.0); // 30 frames per second
 		tui.enter()?;
-		let result = self.run(&mut tui).await;
+		let result = self.run(&mut tui, req_tx, res_rx).await;
 		tui.exit()?;
+
+		read_ws_task.abort();
+		write_ws_task.abort();
 
 		result
 	}
 
-	async fn run(mut self, tui: &mut Tui) -> color_eyre::Result<()> {
+	async fn run(mut self, tui: &mut Tui, req_tx: Sender<Req>, mut res_rx: Receiver<Result<Res, Err>>) -> color_eyre::Result<()> {
 		loop {
 			self.render(tui)?;
+
+			while let Ok(res) = res_rx.try_recv() {
+				match res {
+					Ok(res) => {
+						self.add_msg(format!("received: {:?}", res));
+					},
+					Err(err) => {
+						self.add_msg(format!("error: {:?}", err));
+					},
+				}
+			}
 
 			if let Some(evt) = tui.next().await {
 				match self.state {
@@ -70,7 +132,12 @@ impl<Req, Res, Err> Client<Req, Res, Err> {
 							crossterm::event::KeyCode::Enter => {
 								if !self.input.is_empty() {
 									self.add_msg(format!("sent: {}", self.input.clone()));
-									// self.stream.send(self.input.clone());
+									let Ok(req) = serde_json::from_str::<Req>(&self.input) else {
+										self.add_msg(format!("error: invalid request format: {}", self.input));
+										self.input.clear();
+										continue;
+									};
+									req_tx.send(req).await.expect("request channel should not be closed");
 									self.input.clear();
 								}
 							},
@@ -167,7 +234,12 @@ impl<Req, Res, Err> Client<Req, Res, Err> {
 	}
 }
 
-impl<Req, Res, Err> Client<Req, Res, Err> {
+impl<Req, Res, Err> Client<Req, Res, Err> 
+where 
+	Req: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug + Send + 'static,
+	Res: serde::de::DeserializeOwned + std::fmt::Debug + Send + 'static,
+	Err: serde::de::DeserializeOwned + std::fmt::Debug + Send + 'static,
+{
 	fn add_msg(&mut self, msg: String) {
 		if self.msgs.len() >= MAX_MESSAGES {
 			self.msgs.pop_front();
