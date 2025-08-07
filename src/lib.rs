@@ -79,7 +79,11 @@ where
                                 tokio_tungstenite::tungstenite::Message::Text(text) => {
                                     // TODO: support more message formats
                                     #[cfg(feature = "json")]
-                                    let res = match serde_json::from_str::<Res<Event, Err>>(&text) {
+                                    let parse_res = serde_json::from_str::<Res<Event, Err>>(&text);
+                                    #[cfg(feature = "ron")]
+                                    let parse_res = ron::from_str::<Res<Event, Err>>(&text);
+
+                                    let res = match parse_res {
                                         Ok(res) => res,
                                         Err(err) => {
                                             if let Err(_) = sys_tx.send(err.to_string()).await {
@@ -109,7 +113,12 @@ where
         // write ws messages
         let write_ws_task = tokio::spawn(async move {
             while let Some(req) = req_rx.recv().await {
-                let msg = match serde_json::to_string(&req) {
+                #[cfg(feature = "json")]
+                let serialized = serde_json::to_string(&req);
+                #[cfg(feature = "ron")]
+                let serialized = ron::to_string(&req);
+
+                let msg = match serialized {
                     Ok(msg) => msg,
                     Err(err) => {
                         if let Err(_) = sys_tx.send(err.to_string()).await {
@@ -174,8 +183,12 @@ where
                             crossterm::event::KeyCode::Enter => {
                                 if !self.input.is_empty() {
                                     self.add_msg(format!("sent: {}", self.input.clone()));
-                                    let Ok(req) = serde_json::from_str::<Action>(&self.input)
-                                    else {
+                                    #[cfg(feature = "json")]
+                                    let parse_res = serde_json::from_str::<Action>(&self.input);
+                                    #[cfg(feature = "ron")]
+                                    let parse_res = ron::from_str::<Action>(&self.input);
+
+                                    let Ok(req) = parse_res else {
                                         self.add_msg(format!(
                                             "error: invalid request format: {}",
                                             self.input
@@ -199,6 +212,15 @@ where
                     State::MsgListSelected => match evt {
                         tui::Event::Key(evt) => match evt.code {
                             crossterm::event::KeyCode::Esc => break Ok(()),
+                            crossterm::event::KeyCode::Backspace => {
+                                if evt
+                                    .modifiers
+                                    .contains(crossterm::event::KeyModifiers::SHIFT)
+                                {
+                                    self.input.clear();
+                                    self.add_msg("cleared input box".to_string());
+                                }
+                            }
                             crossterm::event::KeyCode::Tab => self.state = State::InputSelected,
                             crossterm::event::KeyCode::Char('j') => {
                                 match self.scroll_state.selected() {
