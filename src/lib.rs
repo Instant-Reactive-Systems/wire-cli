@@ -5,6 +5,12 @@ use std::collections::VecDeque;
 use tokio::sync::mpsc::{Receiver, Sender};
 pub use tui::Tui;
 
+#[cfg(not(all(
+    any(feature = "out-json", feature = "out-ron"),
+    any(feature = "in-json", feature = "in-ron")
+)))]
+compile_error!("need at least one input and one output feature-flag enabled");
+
 /// The type for incoming messages.
 pub type Res<Event, Err> = std::result::Result<wire::TimestampedEvent<Event>, Err>;
 
@@ -68,55 +74,62 @@ where
         let (sys_tx, sys_rx) = tokio::sync::mpsc::channel::<String>(100);
 
         // read ws messages
-        let read_ws_task = tokio::spawn({
-            let sys_tx = sys_tx.clone();
+        let read_ws_task =
+            tokio::spawn({
+                let sys_tx = sys_tx.clone();
 
-            async move {
-                while let Some(msg) = ws_rx.next().await {
-                    match msg {
-                        Ok(msg) => {
-                            match msg {
-                                tokio_tungstenite::tungstenite::Message::Text(text) => {
-                                    // TODO: support more message formats
-                                    #[cfg(feature = "json")]
-                                    let parse_res = serde_json::from_str::<Res<Event, Err>>(&text);
-                                    #[cfg(feature = "ron")]
-                                    let parse_res = ron::from_str::<Res<Event, Err>>(&text);
+                async move {
+                    while let Some(msg) = ws_rx.next().await {
+                        match msg {
+                            Ok(msg) => {
+                                match msg {
+                                    tokio_tungstenite::tungstenite::Message::Text(text) => {
+                                        // TODO: support more message formats
+                                        #[cfg(feature = "out-json")]
+                                        let parse_res =
+                                            serde_json::from_str::<Res<Event, Err>>(&text);
+                                        #[cfg(feature = "out-ron")]
+                                        let parse_res = ron::from_str::<Res<Event, Err>>(&text);
+                                        #[cfg(not(any(feature = "out-json", feature = "out-ron")))]
+                                        let parse_res: Result<String, String> = unreachable!();
 
-                                    let res = match parse_res {
-                                        Ok(res) => res,
-                                        Err(err) => {
-                                            if let Err(_) = sys_tx.send(err.to_string()).await {
-                                                break;
+                                        let res = match parse_res {
+                                            Ok(res) => res,
+                                            Err(err) => {
+                                                if let Err(_) = sys_tx.send(err.to_string()).await {
+                                                    break;
+                                                }
+                                                continue;
                                             }
-                                            continue;
-                                        }
-                                    };
-                                    if let Err(_err) = res_tx.send(res).await {
-                                        break;
-                                    };
+                                        };
+                                        #[cfg(any(feature = "out-json", feature = "out-ron"))]
+                                        if let Err(_err) = res_tx.send(res).await {
+                                            break;
+                                        };
+                                    }
+                                    _ => {}
                                 }
-                                _ => {}
                             }
-                        }
-                        Err(err) => {
-                            if let Err(_) = sys_tx.send(err.to_string()).await {
-                                break;
+                            Err(err) => {
+                                if let Err(_) = sys_tx.send(err.to_string()).await {
+                                    break;
+                                }
+                                continue;
                             }
-                            continue;
                         }
                     }
                 }
-            }
-        });
+            });
 
         // write ws messages
         let write_ws_task = tokio::spawn(async move {
             while let Some(req) = req_rx.recv().await {
-                #[cfg(feature = "json")]
+                #[cfg(feature = "out-json")]
                 let serialized = serde_json::to_string(&req);
-                #[cfg(feature = "ron")]
+                #[cfg(feature = "out-ron")]
                 let serialized = ron::to_string(&req);
+                #[cfg(not(any(feature = "out-json", feature = "out-ron")))]
+                let serialized: Result<String, String> = unreachable!();
 
                 let msg = match serialized {
                     Ok(msg) => msg,
@@ -183,10 +196,15 @@ where
                             crossterm::event::KeyCode::Enter => {
                                 if !self.input.is_empty() {
                                     self.add_msg(format!("sent: {}", self.input.clone()));
-                                    #[cfg(feature = "json")]
+                                    #[cfg(feature = "in-json")]
                                     let parse_res = serde_json::from_str::<Action>(&self.input);
-                                    #[cfg(feature = "ron")]
+                                    #[cfg(feature = "in-ron")]
                                     let parse_res = ron::from_str::<Action>(&self.input);
+                                    #[cfg(not(any(feature = "in-json", feature = "in-ron")))]
+                                    let parse_res: Result<
+                                        Res<Event, Err>,
+                                        String,
+                                    > = unreachable!();
 
                                     let Ok(req) = parse_res else {
                                         self.add_msg(format!(
@@ -196,6 +214,7 @@ where
                                         self.input.clear();
                                         continue;
                                     };
+                                    #[cfg(any(feature = "in-json", feature = "in-ron"))]
                                     req_tx
                                         .send(req)
                                         .await

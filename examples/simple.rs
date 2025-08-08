@@ -12,9 +12,9 @@ pub async fn main() -> color_eyre::Result<()> {
                     Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
                         let res: Result<wire::TimestampedEvent<String>, String> =
                             Ok(wire::TimestampedEvent::new(text.to_string()));
-                        #[cfg(feature = "json")]
+                        #[cfg(feature = "out-json")]
                         let text = serde_json::to_string(&res).expect("request is always a string");
-                        #[cfg(feature = "ron")]
+                        #[cfg(feature = "out-ron")]
                         let text = ron::to_string(&res).expect("request is always a string");
                         // Echo the message back
                         stream
